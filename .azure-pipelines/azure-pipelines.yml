@@ -1,0 +1,84 @@
+# ============================================================
+# azure-pipelines.yml — Multi-stage CI/CD Pipeline
+# Stages: Build → Push to ACR → Deploy to AKS
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  # Replace with your ACR login server (from terraform output)
+  ACR_LOGIN_SERVER: "cicddemoacr.azurecr.io"
+  IMAGE_NAME: "flask-app"
+  IMAGE_TAG: "$(Build.BuildId)"
+  K8S_NAMESPACE: "default"
+
+# ── Stage 1: Build & Push Docker Image ──────────────────────
+stages:
+  - stage: Build
+    displayName: "Build & Push Docker Image"
+    jobs:
+      - job: BuildAndPush
+        displayName: "Build Docker Image and Push to ACR"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: Docker@2
+            displayName: "Build Docker Image"
+            inputs:
+              command: build
+              repository: "$(ACR_LOGIN_SERVER)/$(IMAGE_NAME)"
+              dockerfile: "app/Dockerfile"
+              buildContext: "app"
+              tags: |
+                $(IMAGE_TAG)
+                latest
+
+          - task: AzureCLI@2
+            displayName: "Push Image to ACR"
+            inputs:
+              azureSubscription: "AzureServiceConnection"   # set in Azure DevOps
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az acr login --name $(ACR_LOGIN_SERVER)
+                docker push $(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(IMAGE_TAG)
+                docker push $(ACR_LOGIN_SERVER)/$(IMAGE_NAME):latest
+
+# ── Stage 2: Deploy to AKS ───────────────────────────────────
+  - stage: Deploy
+    displayName: "Deploy to AKS"
+    dependsOn: Build
+    condition: succeeded()
+    jobs:
+      - deployment: DeployToAKS
+        displayName: "Deploy Flask App to AKS"
+        environment: "production"
+        pool:
+          vmImage: "ubuntu-latest"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - bash: |
+                    # Replace placeholder variables in k8s manifests
+                    sed -i "s|\$(ACR_LOGIN_SERVER)|$(ACR_LOGIN_SERVER)|g" k8s/deployment.yaml
+                    sed -i "s|\$(IMAGE_TAG)|$(IMAGE_TAG)|g" k8s/deployment.yaml
+                  displayName: "Substitute image tag in manifests"
+
+                - task: KubernetesManifest@1
+                  displayName: "Deploy to AKS"
+                  inputs:
+                    action: deploy
+                    connectionType: azureResourceManager
+                    azureSubscriptionConnection: "AzureServiceConnection"
+                    azureResourceGroup: "cicd-demo-rg"
+                    kubernetesCluster: "cicd-demo-aks"
+                    namespace: "$(K8S_NAMESPACE)"
+                    manifests: |
+                      k8s/deployment.yaml
+                      k8s/service.yaml
